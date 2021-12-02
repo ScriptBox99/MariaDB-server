@@ -1175,6 +1175,10 @@ without checking for deadlocks or conflicts.
 @param[in]	index		the index tree
 @param[in,out]	trx		transaction
 @param[in]	holds_trx_mutex	whether the caller holds trx->mutex
+@param[in]	insert_before_waiting if true, inserts none-predicate new lock
+just after the last non-waiting lock of the current transaction which is
+located before the first waiting for the current transaction lock, otherwise
+the lock is inserted at the end of the queue
 @return created lock */
 lock_t*
 lock_rec_create_low(
@@ -1185,7 +1189,8 @@ lock_rec_create_low(
 	ulint		heap_no,
 	dict_index_t*	index,
 	trx_t*		trx,
-	bool		holds_trx_mutex);
+	bool		holds_trx_mutex,
+        bool insert_before_waiting = false);
 
 /** Enqueue a waiting request for a lock which cannot be granted immediately.
 Check for deadlocks.

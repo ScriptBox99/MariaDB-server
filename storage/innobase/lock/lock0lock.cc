@@ -1004,25 +1004,41 @@ func_exit:
 /*********************************************************************//**
 Checks if some other transaction has a conflicting explicit lock request
 in the queue, so that we have to wait.
-@return lock or NULL */
-static
-lock_t*
-lock_rec_other_has_conflicting(
-/*===========================*/
-	unsigned		mode,	/*!< in: LOCK_S or LOCK_X,
-					possibly ORed to LOCK_GAP or
-					LOC_REC_NOT_GAP,
-					LOCK_INSERT_INTENTION */
-	const hash_cell_t&	cell,	/*!< in: lock hash table cell */
-	const page_id_t		id,	/*!< in: page identifier */
-	ulint			heap_no,/*!< in: heap number of the record */
-	const trx_t*		trx)	/*!< in: our transaction */
+@param[in] mode LOCK_S or LOCK_X, possibly ORed to LOCK_GAP or LOC_REC_NOT_GAP,
+LOCK_INSERT_INTENTION
+@param[in] cell lock hash table cell
+@param[in] id page identifier
+@param[in] heap_no heap number of the record
+@param[in] trx our transaction
+@param[out] was_ignored true if conflicting locks waiting for the current
+transaction were ignored
+@return conflicting lock and the flag which indicated if conflicting locks
+which wait for the current transaction were ignored */
+static lock_t *lock_rec_other_has_conflicting(unsigned mode,
+                                              const hash_cell_t &cell,
+                                              const page_id_t id,
+                                              ulint heap_no, const trx_t *trx,
+                                              bool *was_ignored= nullptr)
 {
 	bool	is_supremum = (heap_no == PAGE_HEAP_NO_SUPREMUM);
 
 	for (lock_t* lock = lock_sys_t::get_first(cell, id, heap_no);
 	     lock; lock = lock_rec_get_next(heap_no, lock)) {
-		if (lock_rec_has_to_wait(true, trx, mode, lock, is_supremum)) {
+		/* There is no need to lock lock_sys.wait_mutex to check
+		trx->lock.wait_trx because it's also protected with the cell
+		latch. There also can't be lock loops for one record, because
+		all waiting locks of the record  will always wait for the same
+		lock of the record in a cell array, and check for
+		conflicting lock will always start with the first lock for the
+		heap_no, and go ahead with the same order(the order of the
+		locks in the cell array) */
+                if (lock->is_waiting() && lock->trx->lock.wait_trx == trx)
+                {
+                  if (was_ignored)
+                    *was_ignored= true;
+                  continue;
+                }
+                if (lock_rec_has_to_wait(true, trx, mode, lock, is_supremum)) {
 			return(lock);
 		}
 	}
@@ -1147,6 +1163,10 @@ without checking for deadlocks or conflicts.
 @param[in]	index		the index tree
 @param[in,out]	trx		transaction
 @param[in]	holds_trx_mutex	whether the caller holds trx->mutex
+@param[in]	insert_before_waiting if true, inserts none-predicate new lock
+just after the last non-waiting lock of the current transaction which is
+located before the first waiting for the current transaction lock, otherwise
+the lock is inserted at the end of the queue
 @return created lock */
 lock_t*
 lock_rec_create_low(
@@ -1157,7 +1177,8 @@ lock_rec_create_low(
 	ulint		heap_no,
 	dict_index_t*	index,
 	trx_t*		trx,
-	bool		holds_trx_mutex)
+	bool		holds_trx_mutex,
+        bool insert_before_waiting)
 {
 	lock_t*		lock;
 	ulint		n_bytes;
@@ -1231,8 +1252,32 @@ lock_rec_create_low(
 	index->table->n_rec_locks++;
 	ut_ad(index->table->get_ref_count() || !index->table->can_be_evicted);
 
-	const auto lock_hash = &lock_sys.hash_get(type_mode);
-	HASH_INSERT(lock_t, hash, lock_hash, page_id.fold(), lock);
+        const auto lock_hash= &lock_sys.hash_get(type_mode);
+        if (!(type_mode & (LOCK_PREDICATE | LOCK_PRDT_PAGE)) &&
+            insert_before_waiting)
+        {
+          /* Insert new lock just after the last non-waiting lock of the
+           current transaction which is located before the first waiting for
+           the current transaction lock */
+          lock_t *prev_lock= nullptr;
+          for (lock_t *cur_lock= lock_sys_t::get_first(
+                   lock_hash->array[lock_hash->calc_hash(page_id.fold())],
+                   page_id, heap_no);
+               cur_lock;
+               cur_lock= lock_rec_get_next(heap_no, cur_lock)) {
+            if (cur_lock->is_waiting() && cur_lock->trx->lock.wait_trx == trx)
+              break;
+            if (cur_lock->trx == trx)
+              prev_lock= cur_lock;
+          }
+          if (prev_lock)
+            hash_insert_after(*lock_hash, page_id.fold(), *prev_lock, *lock,
+                              &lock_t::hash);
+          else
+            HASH_INSERT(lock_t, hash, lock_hash, page_id.fold(), lock);
+        }
+        else
+          HASH_INSERT(lock_t, hash, lock_hash, page_id.fold(), lock);
 
 	if (type_mode & LOCK_WAIT) {
 		if (trx->lock.wait_trx) {
@@ -1357,24 +1402,25 @@ on the record, and the request to be added is not a waiting request, we
 can reuse a suitable record lock object already existing on the same page,
 just setting the appropriate bit in its bitmap. This is a low-level function
 which does NOT check for deadlocks or lock compatibility!
+@param[in] type_mode lock mode, wait, gap etc. flags
+@param[in,out] cell first hash table cell
+@param[in] id page identifier
+@param[in] page buffer block containing the record
+@param[in] heap_no heap number of the record
+@param[in] index index of record
+@param[in,out] trx transaction
+@param[in] caller_owns_trx_mutex TRUE if caller owns the transaction mutex
+@param[in] insert_before_waiting insert_before_waiting if true, inserts
+none-predicate new lock just after the last non-waiting lock of the current
+transaction which is located before the first waiting for the current
+transaction lock, otherwise the lock is inserted at the end of the queue
 @return lock where the bit was set */
 TRANSACTIONAL_TARGET
-static
-void
-lock_rec_add_to_queue(
-/*==================*/
-	unsigned		type_mode,/*!< in: lock mode, wait, gap
-					etc. flags */
-	hash_cell_t&		cell,	/*!< in,out: first hash table cell */
-	const page_id_t		id,	/*!< in: page identifier */
-	const page_t*		page,	/*!< in: buffer block containing
-					the record */
-	ulint			heap_no,/*!< in: heap number of the record */
-	dict_index_t*		index,	/*!< in: index of record */
-	trx_t*			trx,	/*!< in/out: transaction */
-	bool			caller_owns_trx_mutex)
-					/*!< in: TRUE if caller owns the
-					transaction mutex */
+static void lock_rec_add_to_queue(unsigned type_mode, hash_cell_t &cell,
+                                  const page_id_t id, const page_t *page,
+                                  ulint heap_no, dict_index_t *index,
+                                  trx_t *trx, bool caller_owns_trx_mutex,
+                                  bool insert_before_waiting= false)
 {
 	ut_d(lock_sys.hash_get(type_mode).assert_locked(id));
 	ut_ad(xtest() || caller_owns_trx_mutex == trx->mutex_is_owner());
@@ -1469,7 +1515,7 @@ create:
 
 	lock_rec_create_low(nullptr,
 			    type_mode, id, page, heap_no, index, trx,
-			    caller_owns_trx_mutex);
+			    caller_owns_trx_mutex, insert_before_waiting);
 }
 
 /*********************************************************************//**
@@ -1536,8 +1582,10 @@ lock_rec_lock(
       /* Do nothing if the trx already has a strong enough lock on rec */
       if (!lock_rec_has_expl(mode, g.cell(), id, heap_no, trx))
       {
+        bool was_ignored = false;
         if (lock_t *c_lock= lock_rec_other_has_conflicting(mode, g.cell(), id,
-                                                           heap_no, trx))
+                                                           heap_no, trx,
+                                                           &was_ignored))
           /*
             If another transaction has a non-gap conflicting
             request in the queue, as this transaction does not
@@ -1550,7 +1598,7 @@ lock_rec_lock(
         {
           /* Set the requested lock on the record. */
           lock_rec_add_to_queue(mode, g.cell(), id, block->page.frame, heap_no,
-                                index, trx, true);
+                                index, trx, true, was_ignored);
           err= DB_SUCCESS_LOCKED_REC;
         }
       }
@@ -4664,9 +4712,22 @@ func_exit:
 #endif /* WITH_WSREP */
 			{
 				ut_ad(other_lock->is_waiting());
-				ut_ad(lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP,
-						        cell, id, heap_no,
-							impl_trx));
+				/* After MDEV-27025 fix the following case is
+				possible:
+				1. trx 1 acquires S-lock;
+				2. trx 2 creates X-lock waiting for trx 1;
+				3. trx 1 creates implicit lock, as
+				lock_rec_other_has_conflicting() returns no
+				conflicting trx 2 X-lock, the explicit lock
+				will not be created;
+				4. trx 3 creates waiting X-lock,
+				it will wait for S-lock of trx 1.
+				That is why we relaxing the condition here and
+				check only for S-lock.
+				*/
+				ut_ad(lock_rec_has_expl(
+				    LOCK_S | LOCK_REC_NOT_GAP, cell, id,
+				    heap_no, impl_trx));
 			}
 		}
 
@@ -5061,7 +5122,7 @@ lock_rec_convert_impl_to_expl_for_trx(
         !lock_rec_has_expl(LOCK_X | LOCK_REC_NOT_GAP, g.cell(), id, heap_no,
                            trx))
       lock_rec_add_to_queue(LOCK_X | LOCK_REC_NOT_GAP, g.cell(), id,
-                            page_align(rec), heap_no, index, trx, true);
+                            page_align(rec), heap_no, index, trx, true, true);
   }
 
   trx->mutex_unlock();

@@ -59,6 +59,31 @@ do {\
 	}\
 } while (0)
 
+/*********************************************************************//**
+Adds an element into hash table just after the certain element.
+@param[in,out] table hash table
+@param[in] fold the new element's fold
+@param[in,out] cell_after the element after which to insert
+@param[in, out] cell_new the element to insert
+@param[in] cell_t::*next_ptr the pointer to the member of the element which
+points to the next element in hash cell */
+template <typename hash_table_t, typename cell_t>
+void hash_insert_after(hash_table_t & ut_d(table),
+                       ulint fold, cell_t &cell_after, cell_t &cell_new,
+                       cell_t *cell_t::*next_ptr)
+{
+#if defined(UNIV_DEBUG) || !defined(DBUG_OFF)
+  cell_t *current_cell=
+      static_cast<cell_t *>(table.array[table.calc_hash(fold)].node);
+  while (current_cell && current_cell != &cell_after)
+    current_cell= current_cell->*next_ptr;
+  ut_a(current_cell);
+  ut_a(current_cell == &cell_after);
+#endif // defined(UNIV_DEBUG) || !defined(DBUG_OFF)
+  cell_new.*next_ptr= cell_after.*next_ptr;
+  cell_after.*next_ptr= &cell_new;
+}
+
 /*******************************************************************//**
 Inserts a struct to the head of hash table. */
 
