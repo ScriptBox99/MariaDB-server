@@ -830,7 +830,7 @@ int SELECT_LEX::vers_setup_conds(THD *thd, TABLE_LIST *tables)
             themselves are not versioned. */
         if (vers_conditions.was_set())
         {
-          my_error(ER_VERS_QUERY_IN_PARTITION, MYF(0), table->alias.str);
+          my_error(ER_VERS_PARTITION_LIST, MYF(0), "historical query");
           DBUG_RETURN(-1);
         }
         else if (!vers_conditions.is_set())

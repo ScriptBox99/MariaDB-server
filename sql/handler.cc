@@ -3977,6 +3977,8 @@ void handler::print_error(int error, myf errflag)
   case HA_ERR_TABLE_IN_FK_CHECK:
     textno= ER_TABLE_IN_FK_CHECK;
     break;
+  case HA_ERR_PARTITION_LIST:
+    my_error(ER_VERS_PARTITION_LIST, errflag, "modifying system versioned table");
   default:
     {
       /* The error was "unknown" to this function.
