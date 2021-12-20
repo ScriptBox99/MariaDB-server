@@ -382,6 +382,10 @@ int ha_spider::open(
     pt_handler_share_key = this;
   }
 #endif
+
+  /*
+    Allocate wide_handler.
+  */
   if (!spider->wide_handler)
   {
     uchar *searched_bitmap;
@@ -443,8 +447,11 @@ int ha_spider::open(
     thr_lock_data_init(&wide_share->lock, &wide_handler->lock, NULL);
   }
 
+  /*
+    Allocate partition_handler_share only if the table is partitioned.
+  */
 #ifdef WITH_PARTITION_STORAGE_ENGINE
-  if (!wide_handler->partition_handler_share)
+  if (part_num && !wide_handler->partition_handler_share)
   {
     pt_handler_mutex = TRUE;
     pthread_mutex_lock(&wide_share->pt_handler_mutex);
@@ -507,6 +514,7 @@ int ha_spider::open(
     partition_handler_share = wide_handler->partition_handler_share;
   }
 #endif
+
   init_sql_alloc_size =
     spider_param_init_sql_alloc_size(thd, share->init_sql_alloc_size);
 
@@ -589,7 +597,8 @@ int ha_spider::open(
     {
       wide_handler->lock_mode =
         pt_clone_source_handler->wide_handler->lock_mode;
-      if (!partition_handler_share->clone_bitmap_init)
+      if (partition_handler_share &&
+          !partition_handler_share->clone_bitmap_init)
       {
         pt_clone_source_handler->set_select_column_mode();
         partition_handler_share->clone_bitmap_init = TRUE;
@@ -1574,7 +1583,8 @@ int ha_spider::reset()
   use_pre_action = FALSE;
   pre_bitmap_checked = FALSE;
   bulk_insert = FALSE;
-  partition_handler_share->clone_bitmap_init = FALSE;
+  if (partition_handler_share)
+    partition_handler_share->clone_bitmap_init= FALSE;
   result_list.tmp_table_join = FALSE;
   result_list.use_union = FALSE;
   result_list.use_both_key = FALSE;
@@ -7488,11 +7498,16 @@ int ha_spider::rnd_next_internal(
   uchar *buf
 ) {
   int error_num;
-  ha_spider *direct_limit_offset_spider =
-    (ha_spider *) partition_handler_share->owner;
-  backup_error_status();
+  ha_spider *direct_limit_offset_spider;
   DBUG_ENTER("ha_spider::rnd_next_internal");
   DBUG_PRINT("info",("spider this=%p", this));
+
+  if (partition_handler_share)
+    direct_limit_offset_spider= (ha_spider *) partition_handler_share->owner;
+  else
+    direct_limit_offset_spider= this;
+  backup_error_status();
+
   if (wide_handler->trx->thd->killed)
   {
     my_error(ER_QUERY_INTERRUPTED, MYF(0));
@@ -7528,10 +7543,9 @@ int ha_spider::rnd_next_internal(
       { // mean has got all result
         DBUG_RETURN(check_error_mode_eof(HA_ERR_END_OF_FILE));
       }
-      if (
-        partition_handler_share->handlers &&
-        direct_limit_offset_spider->direct_current_offset > 0
-      ) {
+      if (partition_handler_share && partition_handler_share->handlers &&
+          direct_limit_offset_spider->direct_current_offset > 0)
+      {
         longlong table_count = this->records();
         DBUG_PRINT("info",("spider table_count=%lld", table_count));
         if (table_count <= direct_limit_offset_spider->direct_current_offset)
@@ -13123,8 +13137,9 @@ void ha_spider::check_distinct_key_query()
 {
   DBUG_ENTER( "ha_spider::check_distinct_key_query" );
 
-  if ( result_list.direct_distinct && !partition_handler_share->handlers &&
-       result_list.keyread && result_list.check_direct_order_limit )
+  if (result_list.direct_distinct &&
+      (partition_handler_share && !partition_handler_share->handlers) &&
+      result_list.keyread && result_list.check_direct_order_limit)
   {
     // SELECT DISTINCT query using an index in a non-partitioned configuration
     KEY_PART_INFO*  key_part = result_list.key_info->key_part;
@@ -13921,10 +13936,9 @@ void ha_spider::check_pre_call(
     use_pre_call = FALSE;
     DBUG_VOID_RETURN;
   }
-  if (
-    use_parallel &&
-    thd->query_id != partition_handler_share->parallel_search_query_id
-  ) {
+  if (use_parallel && partition_handler_share &&
+      thd->query_id != partition_handler_share->parallel_search_query_id)
+  {
     partition_handler_share->parallel_search_query_id = thd->query_id;
     ++wide_handler->trx->parallel_search_count;
   }

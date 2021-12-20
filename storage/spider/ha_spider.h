@@ -93,6 +93,9 @@ public:
   SPIDER_POSITION    pushed_pos_buf;
 #ifdef WITH_PARTITION_STORAGE_ENGINE
   bool               pt_handler_share_owner = FALSE;
+  /*
+    partition_handler_share is assumed to be NULL for non-partitioned tables.
+  */
   SPIDER_PARTITION_HANDLER_SHARE *partition_handler_share;
 #endif
   bool                wide_handler_owner = FALSE;
