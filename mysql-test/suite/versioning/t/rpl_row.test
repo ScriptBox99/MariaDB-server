@@ -1,5 +1,6 @@
 --source include/have_binlog_format_row.inc
 --source include/master-slave.inc
+--source suite/versioning/common.inc
 
 --echo # MDEV-16252: MINIMAL binlog_row_image does not work for versioned tables
 set @old_row_image= @@binlog_row_image;
@@ -15,4 +16,30 @@ update t1 set i = 0;
 drop table t1;
 set binlog_row_image= @old_row_image;
 
+--echo #
+--echo # MDEV-23486 RBR can bypass secure_timestamp=YES
+--echo #
+create table t1 (a int, rs timestamp(6) not null, re timestamp(6) not null);
+sync_slave_with_master;
+stop slave;
+drop table t1;
+create table t1 (a int, rs timestamp(6) as row start, re timestamp(6) as row end,  period for system_time(rs,re)) with system versioning;
+start slave;
+set @@session.time_zone= '+00:00';
+connection master;
+--echo # create two rows on the slave: one in the past, one with some fake row_start
+insert t1 values (1, '2010-10-10 10:10:10', '2011-11-11 11:11:11');
+insert t1 values (2, '2010-10-10 10:10:10', from_unixtime(2147483647.999999));
+sync_slave_with_master;
+select @@secure_timestamp;
+select a, rs = '2010-10-10 10:10:10' as manual, check_row(rs, re) from t1 for system_time all order by a;
+connection master;
+--echo # now update the versioned row on the slave without leaving any trace
+update t1 set a= 3, rs= '2009-09-09 9:9:9' where a = 2;
+sync_slave_with_master;
+select a, rs != '2009-09-09 9:9:9' as ok, check_row(rs, re) from t1 for system_time all order by a;
+connection master;
+drop table t1;
+
+--source suite/versioning/common_finish.inc
 --source include/rpl_end.inc

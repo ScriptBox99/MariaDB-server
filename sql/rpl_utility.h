@@ -241,6 +241,7 @@ struct RPL_TABLE_LIST
   table_def m_tabledef;
   TABLE *m_conv_table;
   bool master_had_triggers;
+  bool versioned_master;
 };
 
 

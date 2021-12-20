@@ -1,0 +1,25 @@
+--- rpl_row.result
++++ rpl_row,secure-no.reject
+@@ -28,18 +28,18 @@
+ connection slave;
+ select @@secure_timestamp;
+ @@secure_timestamp
+-YES
++NO
+ select a, rs = '2010-10-10 10:10:10' as manual, check_row(rs, re) from t1 for system_time all order by a;
+ a	manual	check_row(rs, re)
+-1	0	CURRENT ROW
+-2	0	CURRENT ROW
++1	1	HISTORICAL ROW
++2	1	CURRENT ROW
+ connection master;
+ # now update the versioned row on the slave without leaving any trace
+ update t1 set a= 3, rs= '2009-09-09 9:9:9' where a = 2;
+ connection slave;
+ select a, rs != '2009-09-09 9:9:9' as ok, check_row(rs, re) from t1 for system_time all order by a;
+ a	ok	check_row(rs, re)
+-1	1	CURRENT ROW
++1	1	HISTORICAL ROW
+ 2	1	HISTORICAL ROW
+ 3	1	CURRENT ROW
+ connection master;

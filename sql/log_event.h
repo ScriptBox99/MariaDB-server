@@ -4297,6 +4297,7 @@ public:
     TM_NO_FLAGS = 0U,
     TM_BIT_LEN_EXACT_F = (1U << 0),
     // MariaDB flags (we starts from the other end)
+    TM_SYSTEM_VERSIONED= (1U << 13),
     TM_BIT_HAS_TRIGGERS_F= (1U << 14)
   };
 
@@ -4626,9 +4627,6 @@ protected:
 
   uchar    *m_extra_row_data;   /* Pointer to extra row data if any */
                                 /* If non null, first byte is length */
-
-  bool m_vers_from_plain;
-
 
   /* helper functions */
 

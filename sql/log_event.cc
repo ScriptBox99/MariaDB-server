@@ -11508,6 +11508,8 @@ int Rows_log_event::do_apply_event(rpl_group_info *rgi)
       {
         ptr->table->master_had_triggers=
           ((RPL_TABLE_LIST*)ptr)->master_had_triggers;
+        ptr->table->versioned_master=
+          ((RPL_TABLE_LIST*)ptr)->versioned_master;
       }
     }
 
@@ -12538,6 +12540,9 @@ Table_map_log_event::Table_map_log_event(THD *thd, TABLE *tbl, ulong tid,
   if (tbl->triggers)
     m_flags|= TM_BIT_HAS_TRIGGERS_F;
 
+  if (tbl->versioned())
+    m_flags|= TM_SYSTEM_VERSIONED;
+
   /* If malloc fails, caught in is_valid() */
   if ((m_memory= (uchar*) my_malloc(m_colcnt, MYF(MY_WME))))
   {
@@ -12970,6 +12975,7 @@ int Table_map_log_event::do_apply_event(rpl_group_info *rgi)
                        table_list->table_name.str,
                        table_list->table_id));
   table_list->master_had_triggers= ((m_flags & TM_BIT_HAS_TRIGGERS_F) ? 1 : 0);
+  table_list->versioned_master= ((m_flags & TM_SYSTEM_VERSIONED) ? 1 : 0);
   DBUG_PRINT("debug", ("table->master_had_triggers=%d", 
                        (int)table_list->master_had_triggers));
 
@@ -13503,11 +13509,12 @@ Rows_log_event::write_row(rpl_group_info *rgi,
   // Handle INSERT.
   if (table->versioned(VERS_TIMESTAMP))
   {
-    ulong sec_part;
-    bitmap_set_bit(table->read_set, table->vers_start_field()->field_index);
+    Field *row_end= table->vers_end_field();
+    bitmap_set_bit(table->read_set, row_end->field_index);
     table->file->column_bitmaps_signal();
     // Check whether a row came from unversioned table and fix vers fields.
-    if (table->vers_start_field()->get_timestamp(&sec_part) == 0 && sec_part == 0)
+    if (!table->versioned_master &&
+        (opt_secure_timestamp > SECTIME_REPL || row_end->val_int() == 0))
       table->vers_update_fields();
   }
 
@@ -14050,21 +14057,20 @@ int Rows_log_event::find_row(rpl_group_info *rgi)
   prepare_record(table, m_width, FALSE);
   error= unpack_current_row(rgi);
 
-  m_vers_from_plain= false;
   if (table->versioned())
   {
     Field *row_end= table->vers_end_field();
     DBUG_ASSERT(table->read_set);
     bitmap_set_bit(table->read_set, row_end->field_index);
-    // check whether master table is unversioned
-    if (row_end->val_int() == 0)
+    if (!table->versioned_master)
     {
       bitmap_set_bit(table->write_set, row_end->field_index);
-      // Plain source table may have a PRIMARY KEY. And row_end is always
-      // a part of PRIMARY KEY. Set it to max value for engine to find it in
-      // index. Needed for an UPDATE/DELETE cases.
+      /*
+         Plain source table may have a PRIMARY KEY. And row_end is always
+         a part of PRIMARY KEY. Set it to max value for engine to find it in
+         index. Needed for an UPDATE/DELETE cases.
+      */
       table->vers_end_field()->set_max();
-      m_vers_from_plain= true;
     }
     table->file->column_bitmaps_signal();
   }
@@ -14435,7 +14441,7 @@ int Delete_rows_log_event::do_exec_row(rpl_group_info *rgi)
     if (likely(!error))
     {
       m_table->mark_columns_per_binlog_row_image();
-      if (m_vers_from_plain && m_table->versioned(VERS_TIMESTAMP))
+      if (!m_table->versioned_master && m_table->versioned(VERS_TIMESTAMP))
       {
         Field *end= m_table->vers_end_field();
         bitmap_set_bit(m_table->write_set, end->field_index);
@@ -14628,6 +14634,7 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
     slave_run_triggers_for_rbr && !master_had_triggers && m_table->triggers;
   const char *tmp= thd->get_proc_info();
   const char *message= "Update_rows_log_event::find_row()";
+  bool insert_history= false;
   DBUG_ASSERT(m_table != NULL);
 
 #ifdef WSREP_PROC_INFO
@@ -14714,12 +14721,23 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
     goto err;
   }
 
-  if (m_vers_from_plain && m_table->versioned(VERS_TIMESTAMP))
-    m_table->vers_update_fields();
+  if (m_table->versioned(VERS_TIMESTAMP))
+  {
+    /* NOTE: we updated row_end in Rows_log_event::find_row() to max value */
+    Field *row_start= m_table->vers_start_field();
+    bitmap_set_bit(m_table->read_set, row_start->field_index);
+    m_table->file->column_bitmaps_signal();
+    // Check whether a row came from unversioned table and fix vers fields.
+    if (!m_table->versioned_master)
+    {
+      insert_history= true;
+      m_table->vers_update_fields();
+    }
+  }
   error= m_table->file->ha_update_row(m_table->record[1], m_table->record[0]);
   if (unlikely(error == HA_ERR_RECORD_IS_THE_SAME))
     error= 0;
-  if (m_vers_from_plain && m_table->versioned(VERS_TIMESTAMP))
+  if (insert_history)
   {
     store_record(m_table, record[2]);
     error= vers_insert_history_row(m_table);

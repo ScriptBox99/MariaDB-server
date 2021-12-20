@@ -1413,6 +1413,7 @@ public:
 #ifdef HAVE_REPLICATION
   /* used in RBR Triggers */
   bool master_had_triggers;
+  bool versioned_master;
 #endif
 
   REGINFO reginfo;			/* field connections */
