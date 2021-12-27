@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2015, 2020, MariaDB
+   Copyright (c) 2015, 2021, MariaDB
 
  This program is free software; you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -1755,19 +1755,110 @@ const Type_handler *Type_handler_typelib::cast_to_int_type_handler() const
 
 /***************************************************************************/
 
+class Recursive_type_pair_iterator
+{
+  const Type_handler *m_a;
+  const Type_handler *m_b;
+  uint m_switched_to_base_count;
+public:
+  Recursive_type_pair_iterator(const Type_handler *a,
+                               const Type_handler *b,
+                               uint switched_to_base_count= 0)
+   :m_a(a), m_b(b), m_switched_to_base_count(switched_to_base_count)
+  { }
+  const Type_handler *a() const { return m_a; }
+  const Type_handler *b() const { return m_b; }
+  Recursive_type_pair_iterator base() const
+  {
+    Recursive_type_pair_iterator res(m_a->type_handler_base(),
+                                     m_b->type_handler_base());
+    res.m_switched_to_base_count= (res.m_a != NULL) + (res.m_b != NULL);
+    if (res.m_a == NULL)
+      res.m_a= m_a;
+    if (res.m_b == NULL)
+      res.m_b= m_b;
+    return res;
+  }
+  bool done() const
+  {
+    switch (m_switched_to_base_count)
+    {
+    case 2:
+      /*
+        Expression:
+          COALESCE(TYPE1, TYPE2)
+
+        where both type handlers derive from some other handlers, e.g.
+          VARCHAR -> TYPE1
+          TEXT    -> TYPE2
+
+        Continue aggregation as:
+          SELECT COALESCE(VARCHAR, TEXT)
+
+        Note, we now have only one level of data type inheritance,
+          e.g. VARCHAR -> VARCHAR/JSON
+
+        This code branch will change when we have longer inheritance chains:
+          A0 -> A1 -> A2 -> A3
+          B0 -> B1 -> B2
+
+        Functions like COALESE(A2, B2) will need to do full overload resolution:
+        - iterate through all pairs from the below matrix
+        - find all existing candidates
+        - resolve ambiguities in case multiple candidates, etc.
+
+            A0 A1 A2 A3
+         B0  .  .  .  .
+         B1  .  .  .  .
+         B2  .  .  .  .
+      */
+      return false;
+
+    case 1:
+      /*
+         Expression:
+           COALESCE(TYPE1, TEXT)
+
+         If only one handler derives from some other handler:
+           VARCHAR-> TYPE1
+
+         Continue aggregation as:
+           SELECT COALESCE(VARCHAR, TEXT)
+      */
+      return false;
+
+    case 0:
+    default:
+      /*
+        Non of the two handlers are derived from other handlers.
+        Nothing left to try.
+      */
+      return true;
+    }
+  }
+};
+
+
 bool
 Type_handler_hybrid_field_type::aggregate_for_result(const Type_handler *other)
 {
-  const Type_handler *hres;
-  const Type_collection *c;
-  if (!(c= Type_handler::type_collection_for_aggregation(m_type_handler, other)) ||
-      !(hres= c->aggregate_for_result(m_type_handler, other)))
-    hres= type_handler_data->
-            m_type_aggregator_for_result.find_handler(m_type_handler, other);
-  if (!hres)
-    return true;
-  m_type_handler= hres;
-  return false;
+  Recursive_type_pair_iterator it(m_type_handler, other);
+  for ( ; ; )
+  {
+    const Type_handler *hres;
+    const Type_collection *c;
+    if (((c= Type_handler::type_collection_for_aggregation(it.a(), it.b())) &&
+         (hres= c->aggregate_for_result(it.a(), it.b()))) ||
+        (hres= type_handler_data->
+                m_type_aggregator_for_result.find_handler(it.a(), it.b())))
+    {
+      m_type_handler= hres;
+      return false;
+    }
+    if ((it= it.base()).done())
+      break;
+  }
+  return true;
 }
 
 
@@ -1971,26 +2062,31 @@ Type_collection_std::aggregate_for_comparison(const Type_handler *ha,
 bool
 Type_handler_hybrid_field_type::aggregate_for_min_max(const Type_handler *h)
 {
-  const Type_handler *hres;
-  const Type_collection *c;
-  if (!(c= Type_handler::type_collection_for_aggregation(m_type_handler, h))||
-      !(hres= c->aggregate_for_min_max(m_type_handler, h)))
+  Recursive_type_pair_iterator it(m_type_handler, h);
+  for ( ; ; )
   {
-    /*
-      For now we suppose that these two expressions:
-        - LEAST(type1, type2)
-        - COALESCE(type1, type2)
-      return the same data type (or both expressions return error)
-      if type1 and/or type2 are non-traditional.
-      This may change in the future.
-    */
-    hres= type_handler_data->
-            m_type_aggregator_for_result.find_handler(m_type_handler, h);
+    const Type_handler *hres;
+    const Type_collection *c;
+    if (((c= Type_handler::type_collection_for_aggregation(it.a(), it.b())) &&
+         (hres= c->aggregate_for_min_max(it.a(), it.b()))) ||
+        (hres= type_handler_data->
+                m_type_aggregator_for_result.find_handler(it.a(), it.b())))
+    {
+      /*
+        For now we suppose that these two expressions:
+          - LEAST(type1, type2)
+          - COALESCE(type1, type2)
+        return the same data type (or both expressions return error)
+        if type1 and/or type2 are non-traditional.
+        This may change in the future.
+      */
+      m_type_handler= hres;
+      return false;
+    }
+    if ((it= it.base()).done())
+      break;
   }
-  if (!hres)
-    return true;
-  m_type_handler= hres;
-  return false;
+  return true;
 }
 
 
@@ -2129,15 +2225,22 @@ Type_handler_hybrid_field_type::aggregate_for_num_op(const Type_aggregator *agg,
                                                      const Type_handler *h0,
                                                      const Type_handler *h1)
 {
-  const Type_handler *hres;
-  const Type_collection *c;
-  if (!(c= Type_handler::type_collection_for_aggregation(h0, h1)) ||
-      !(hres= c->aggregate_for_num_op(h0, h1)))
-    hres= agg->find_handler(h0, h1);
-  if (!hres)
-    return true;
-  m_type_handler= hres;
-  return false;
+  Recursive_type_pair_iterator it(h0, h1);
+  for ( ; ; )
+  {
+    const Type_handler *hres;
+    const Type_collection *c;
+    if (((c= Type_handler::type_collection_for_aggregation(it.a(), it.b())) &&
+         (hres= c->aggregate_for_num_op(it.a(), it.b()))) ||
+        (hres= agg->find_handler(it.a(), it.b())))
+    {
+      m_type_handler= hres;
+      return false;
+    }
+    if ((it= it.base()).done())
+      break;
+  }
+  return true;
 }
 
 
