@@ -3262,6 +3262,11 @@ unlocked_free_and_exit:
 		}
 	}
 
+	ret= trx->bulk_insert_apply();
+	if (ret != DB_SUCCESS) {
+		goto rollback_and_exit;
+	}
+
 	trx->commit();
 	goto free_and_exit;
 }
