@@ -1,4 +1,7 @@
-CREATE TABLE t (a int not null, b int not null, primary key(a), unique key(b)) engine = innodb;
+#
+# MDEV-27025 insert-intention lock conflicts with waiting ORDINARY lock
+#
+CREATE TABLE t (a INT PRIMARY KEY, b INT NOT NULL UNIQUE) ENGINE=InnoDB;
 connect prevent_purge,localhost,root,,;
 start transaction with consistent snapshot;
 connection default;
@@ -15,10 +18,10 @@ connection default;
 SET DEBUG_SYNC = 'now WAIT_FOR del_locked';
 SET DEBUG_SYNC = 'now SIGNAL ins_cont';
 connection con_ins;
-connection con_del;
-disconnect prevent_purge;
 disconnect con_ins;
+connection con_del;
 disconnect con_del;
+disconnect prevent_purge;
 connection default;
 SET DEBUG_SYNC = 'RESET';
 DROP TABLE t;
